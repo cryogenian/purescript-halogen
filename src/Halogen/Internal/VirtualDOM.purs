@@ -54,11 +54,21 @@ foreign import emptyProps
 -- | Users should use caution when creating custom attributes, and understand how they will
 -- | be added to the DOM here.
 foreign import prop
-  "function prop(key, value) {\
-  \  var props = {};\
-  \  props[key] = value;\
-  \  return props;\
-  \}" :: forall value. Fn2 String value Props
+  """function prop(key, value) {
+    var props = {attributes: {}},
+        toAttr = function(key) {
+          if (key == 'readonly') return true;
+          if (key.indexOf('data-') == 0) return true;
+        };
+    
+    if (toAttr(key)) {
+      props.attributes[key] = value;
+    } else {
+      props[key] = value;
+    }
+    return props;
+  }""" :: forall value. Fn2 String value Props
+
 
 -- | Create a property from an event handler
 foreign import handlerProp
@@ -105,17 +115,41 @@ foreign import finalizerProp
   \  return props;\
   \}" :: forall eff. Eff eff Unit -> Props
 
+
 foreign import concatProps
-  "function concatProps(p1, p2) {\
-  \  var props = {};\
-  \  for (var key in p1) {\
-  \    props[key] = p1[key];\
-  \  }\
-  \  for (var key in p2) {\
-  \    props[key] = p2[key];\
-  \  }\
-  \  return props;\
-  \}" :: Fn2 Props Props Props
+  """function concatProps(p1, p2) {
+    var props = {},
+        a1 = p1.attributes || {},
+        a2 = p1.attributes || {},
+        a = {},
+        key;
+    var flag = false;
+    for (var key in a2) {
+      if (a2.hasOwnProperty(key)) {
+        a[key] = a2[key];
+      }
+    }
+    for (var key in a1) {
+      if (a1.hasOwnProperty(key)) {
+        a[key] = a1[key];
+      }
+    }
+    delete p1.attributes;
+    delete p2.attributes;
+    for (var key in p1) {
+      if (p1.hasOwnProperty(key)) {
+        props[key] = p1[key];
+      }
+    }
+    for (var key in p2) {
+      if (p2.hasOwnProperty(key)) {
+        props[key] = p2[key];
+      }
+    }
+    props.attributes = a;
+    if (flag) console.log(props);
+    return props;
+  }""" :: Fn2 Props Props Props
 
 instance semigroupProps :: Semigroup Props where
   (<>) = runFn2 concatProps
