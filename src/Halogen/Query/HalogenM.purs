@@ -11,7 +11,6 @@ import Control.Monad.Free (Free, hoistFree, liftF)
 import Control.Monad.Reader.Class (class MonadAsk, ask)
 import Control.Monad.Rec.Class (class MonadRec, tailRecM, Step(..))
 import Control.Monad.State.Class (class MonadState)
-import Control.Monad.Trans.Class (class MonadTrans)
 import Control.Monad.Writer.Class (class MonadTell, tell)
 import Control.Parallel.Class (class Parallel)
 
@@ -27,8 +26,29 @@ import Halogen.Query.EventSource as ES
 import Halogen.Query.ForkF as FF
 import Halogen.Query.InputF (RefLabel)
 
+import Unsafe.Coerce (unsafeCoerce)
+
+class RowEquals (a :: # *) (b :: # *) | a -> b, b -> a where
+  toR :: forall p. p a -> p b
+  fromR :: forall p. p b -> p a
+
+instance reflR :: RowEquals r r where
+  toR = id
+  fromR = id
+
+-- | This is used internally to coerce multiple data structures from
+-- | `D a b c` to `D' (a :: a, b :: b)`
+class TypeEqualsInternal a b | a -> b, b -> a where
+  to :: a -> b
+  from :: b -> a
+
+data QueryRow (f :: * -> *)
+data EffectRow (f :: * -> *)
+data ViewRow (f :: * -> * -> *)
+
+
 -- | The Halogen component algebra
-data HalogenF s (f :: * -> *) g p o m a
+data HalogenF s (f :: * -> *) g p o m (r :: # *) a
   = GetState (s -> a)
   | ModifyState (s -> Tuple a s)
   | Subscribe (ES.EventSource f m) a
@@ -38,11 +58,11 @@ data HalogenF s (f :: * -> *) g p o m a
   | CheckSlot p (Boolean -> a)
   | ChildQuery p (Coyoneda g a)
   | Raise o a
-  | Par (HalogenAp s f g p o m a)
-  | Fork (FF.Fork (HalogenM s f g p o m) a)
+  | Par (HalogenAp s f g p o m r a)
+  | Fork (FF.Fork (Free (HalogenF s f g p o m r)) a)
   | GetRef RefLabel (Maybe Foreign -> a)
 
-instance functorHalogenF :: Functor m => Functor (HalogenF s f g p o m) where
+instance functorHalogenF :: Functor m => Functor (HalogenF s f g p o m r) where
   map f = case _ of
     GetState k -> GetState (f <<< k)
     ModifyState k -> ModifyState (lmap f <<< k)
@@ -57,108 +77,307 @@ instance functorHalogenF :: Functor m => Functor (HalogenF s f g p o m) where
     Fork fa -> Fork (map f fa)
     GetRef p k -> GetRef p (map f k)
 
-newtype HalogenAp s f g p o m a = HalogenAp (FreeAp (HalogenM s f g p o m) a)
+newtype HalogenAp s f g p o m r a  =
+  HalogenAp (FreeAp (Free (HalogenF s f g p o m r)) a)
 
-derive instance newtypeHalogenAp :: Newtype (HalogenAp s f g p o m a) _
-derive newtype instance functorHalogenAp :: Functor (HalogenAp s f g p o m)
-derive newtype instance applyHalogenAp :: Apply (HalogenAp s f g p o m)
-derive newtype instance applicativeHalogenAp :: Applicative (HalogenAp s f g p o m)
 
-newtype HalogenM s (f :: * -> *) g p o m a = HalogenM (Free (HalogenF s f g p o m) a)
+derive instance newtypeHalogenAp :: Newtype (HalogenAp s f g p o m r a) _
+derive newtype instance functorHalogenAp :: Functor (HalogenAp s f g p o m r)
+derive newtype instance applyHalogenAp :: Apply (HalogenAp s f g p o m r)
+derive newtype instance applicativeHalogenAp :: Applicative (HalogenAp s f g p o m r)
 
-instance functorHalogenM :: Functor (HalogenM s f g p o m) where
-  map f (HalogenM fa) = HalogenM (map f fa)
+data HalogenM (r :: # *) a
 
-instance applyHalogenM :: Apply (HalogenM s f g p o m) where
-  apply (HalogenM fa) (HalogenM fb) = HalogenM (apply fa fb)
+instance halogenMISEqualFree
+  :: RowEquals r ( state :: s
+                 , query :: QueryRow f
+                 , childQuery :: QueryRow g
+                 , childSlot :: p
+                 , output :: o
+                 , effect :: EffectRow m
+                 | rr)
+  => TypeEqualsInternal (HalogenM r a) (Free (HalogenF s f g p o m rr) a) where
+  to = unsafeCoerce
+  from = unsafeCoerce
 
-instance applicativeHalogenM :: Applicative (HalogenM s f g p o m) where
-  pure a = HalogenM (pure a)
+instance functorHalogenM
+  :: RowEquals r ( state :: s
+                 , query :: QueryRow f
+                 , childQuery :: QueryRow g
+                 , childSlot :: p
+                 , output :: o
+                 , effect :: EffectRow m
+                 | rr)
+  => Functor (HalogenM r) where
+  map f hm = from $ map f $ to hm
 
-instance bindHalogenM :: Bind (HalogenM s f g p o m) where
-  bind (HalogenM fa) f = HalogenM (fa >>= \x -> case f x of HalogenM fb -> fb)
+instance applyHalogenM
+  :: RowEquals r ( state :: s
+                 , query :: QueryRow f
+                 , childQuery :: QueryRow g
+                 , childSlot :: p
+                 , output :: o
+                 , effect :: EffectRow m
+                 | rr)
+  => Apply (HalogenM r) where
+  apply f w = from $ apply (to f) (to w)
 
-instance monadHalogenM :: Monad (HalogenM s f g p o m)
+instance applicativeHalogenM
+  :: RowEquals r ( state :: s
+                 , query :: QueryRow f
+                 , childQuery :: QueryRow g
+                 , childSlot :: p
+                 , output :: o
+                 , effect :: EffectRow m
+                 | rr )
+  => Applicative (HalogenM r) where
+  pure a = from $ pure a
 
-instance monadEffHalogenM :: MonadEff eff m => MonadEff eff (HalogenM s f g p o m) where
-  liftEff eff = HalogenM $ liftF $ Lift $ liftEff eff
+instance bindHalogenM
+  :: RowEquals r ( state :: s
+                 , query :: QueryRow f
+                 , childQuery :: QueryRow g
+                 , childSlot :: p
+                 , output :: o
+                 , effect :: EffectRow m
+                 | rr )
+  => Bind (HalogenM r) where
+  bind rfa rf = from $ to rfa >>= \x -> to $ rf x
 
-instance monadAffHalogenM :: MonadAff eff m => MonadAff eff (HalogenM s f g p o m) where
-  liftAff aff = HalogenM $ liftF $ Lift $ liftAff aff
+instance monadHalogenM
+  :: RowEquals r ( state :: s
+                 , query :: QueryRow f
+                 , childQuery :: QueryRow g
+                 , childSlot :: p
+                 , output :: o
+                 , effect :: EffectRow m
+                 | rr )
+  => Monad (HalogenM r)
 
-instance parallelHalogenM :: Parallel (HalogenAp s f g p o m) (HalogenM s f g p o m) where
-  parallel = HalogenAp <<< liftFreeAp
-  sequential = HalogenM <<< liftF <<< Par
+instance monadEffHalogenM
+  :: ( RowEquals r ( state :: s
+                   , query :: QueryRow f
+                   , childQuery :: QueryRow g
+                   , childSlot :: p
+                   , output :: o
+                   , effect :: EffectRow m
+                   | rr )
+     , MonadEff eff m)
+  => MonadEff eff (HalogenM r) where
+  liftEff eff = from $ liftF $ Lift $ liftEff eff
 
-instance monadForkHalogenM :: MonadAff eff m => MonadFork Error (HalogenM s f g p o m) where
-  fork a = map liftAff <$> HalogenM (liftF $ Fork $ FF.fork a)
 
-instance monadTransHalogenM :: MonadTrans (HalogenM s f g p o) where
-  lift m = HalogenM $ liftF $ Lift m
+instance monadAffHalogenM
+  :: ( RowEquals r ( state :: s
+                   , query :: QueryRow f
+                   , childQuery :: QueryRow g
+                   , childSlot :: p
+                   , output :: o
+                   , effect :: EffectRow m
+                   | rr )
+     , MonadAff eff m)
+  => MonadAff eff (HalogenM r) where
+  liftAff aff = from $ liftF $ Lift $ liftAff aff
 
-instance monadRecHalogenM :: MonadRec (HalogenM s f g p o m) where
-  tailRecM k a = k a >>= go
-    where
-    go (Loop x) = tailRecM k x
-    go (Done y) = pure y
+-- TODO: for some reason it's broken -_-
+instance parallelHalogenM
+  :: RowEquals r ( state :: s
+                 , query :: QueryRow f
+                 , childQuery :: QueryRow g
+                 , childSlot :: p
+                 , output :: o
+                 , effect :: EffectRow m
+                 | rr)
+  => Parallel (HalogenAp s f g p o m rr) (HalogenM r) where
+  parallel = HalogenAp <<< liftFreeAp <<< to
+  sequential = from <<< liftF <<< Par
 
-instance monadStateHalogenM :: MonadState s (HalogenM s f g p o m) where
-  state = HalogenM <<< liftF <<< ModifyState
 
-instance monadAskHalogenM :: MonadAsk r m => MonadAsk r (HalogenM s f g p o m) where
-  ask = HalogenM $ liftF $ Lift $ ask
+instance monadForkHalogenM
+  :: ( RowEquals r ( state :: s
+                   , query :: QueryRow f
+                   , childQuery :: QueryRow g
+                   , childSlot :: p
+                   , output :: o
+                   , effect :: EffectRow m
+                   | rr )
+     , MonadAff eff m)
+  => MonadFork Error (HalogenM r) where
+  fork a = map liftAff <$> (from $ liftF $ Fork $ FF.fork $ to a)
 
-instance monadTellHalogenM :: MonadTell w m => MonadTell w (HalogenM s f g p o m) where
-  tell = HalogenM <<< liftF <<< Lift <<< tell
 
-halt :: forall s f g p o m a. String -> HalogenM s f g p o m a
-halt msg = HalogenM $ liftF $ Halt msg
+instance monadRecHalogenM
+  :: RowEquals r ( state :: s
+                 , query :: QueryRow f
+                 , childQuery :: QueryRow g
+                 , childSlot :: p
+                 , output :: o
+                 , effect :: EffectRow m
+                 | rr )
+  => MonadRec (HalogenM r) where
+  tailRecM k a = k a >>= case _ of
+    Loop x -> tailRecM k x
+    Done y -> pure y
+
+
+instance monadStateHalogenM
+  :: RowEquals r ( state :: s
+                 , query :: QueryRow f
+                 , childQuery :: QueryRow g
+                 , childSlot :: p
+                 , output :: o
+                 , effect :: EffectRow m
+                 | rr )
+  => MonadState s (HalogenM r) where
+  state = from <<< liftF <<< ModifyState
+
+instance monadAskHalogenM
+  :: ( RowEquals r ( state :: s
+                   , query :: QueryRow f
+                   , childQuery :: QueryRow g
+                   , childSlot :: p
+                   , output :: o
+                   , effect :: EffectRow m
+                   | rr )
+     , MonadAsk a m )
+  => MonadAsk a (HalogenM r) where
+  ask = from $ liftF $ Lift $ ask
+
+instance monadTellHalogenM
+  :: ( RowEquals r ( state :: s
+                   , query :: QueryRow f
+                   , childQuery :: QueryRow g
+                   , childSlot :: p
+                   , output :: o
+                   , effect :: EffectRow m
+                   | rr )
+     , MonadTell w m)
+  => MonadTell w (HalogenM r) where
+  tell = from <<< liftF <<< Lift <<< tell
+
+lift
+  :: forall s f g p o m r a
+   . Monad m
+  => m a
+  -> HalogenM ( state :: s
+              , query :: QueryRow f
+              , childQuery :: QueryRow g
+              , childSlot :: p
+              , output :: o
+              , effect :: EffectRow m|r) a
+lift m = from $ liftF $ Lift m
+
+
+halt
+  :: forall s f g p o m a r
+   . String
+  -> HalogenM ( state :: s
+              , query :: QueryRow f
+              , childQuery :: QueryRow g
+              , childSlot :: p
+              , output :: o
+              , effect :: EffectRow m|r) a
+halt msg = from $ liftF $ Halt msg
 
 mkQuery
-  :: forall s f g p o m a
+  :: forall s f g p o m a r
    . Eq p
   => p
   -> g a
-  -> HalogenM s f g p o m a
-mkQuery p = HalogenM <<< liftF <<< ChildQuery p <<< coyoneda id
+  -> HalogenM ( state :: s
+              , query :: QueryRow f
+              , childQuery :: QueryRow g
+              , childSlot :: p
+              , output :: o
+              , effect :: EffectRow m|r) a
+mkQuery p = from <<< liftF <<< ChildQuery p <<< coyoneda id
 
-getSlots :: forall s f g p o m. HalogenM s f g p o m (L.List p)
-getSlots = HalogenM $ liftF $ GetSlots id
+getSlots
+  :: forall s f g p o m r
+   . HalogenM ( state :: s
+              , query :: QueryRow f
+              , childQuery :: QueryRow g
+              , childSlot :: p
+              , output :: o
+              , effect :: EffectRow m|r) (L.List p)
+getSlots = from $ liftF $ GetSlots id
 
-checkSlot :: forall s f g p o m. p -> HalogenM s f g p o m Boolean
-checkSlot p = HalogenM $ liftF $ CheckSlot p id
+checkSlot
+  :: forall s f g p o m r
+   . p
+  -> HalogenM ( state :: s
+              , query :: QueryRow f
+              , childQuery :: QueryRow g
+              , childSlot :: p
+              , output :: o
+              , effect :: EffectRow m|r) Boolean
+checkSlot p = from $ liftF $ CheckSlot p id
 
-getRef :: forall s f g p o m. RefLabel -> HalogenM s f g p o m (Maybe Foreign)
-getRef p = HalogenM $ liftF $ GetRef p id
+getRef
+  :: forall s f g p o m r
+   . RefLabel
+  -> HalogenM ( state :: s
+              , query :: QueryRow f
+              , childQuery :: QueryRow g
+              , childSlot :: p
+              , output :: o
+              , effect :: EffectRow m|r) (Maybe Foreign)
+getRef p = from $ liftF $ GetRef p id
 
 -- | Provides a way of having a component subscribe to an `EventSource` from
 -- | within an `Eval` function.
-subscribe :: forall s f g p o m. ES.EventSource f m -> HalogenM s f g p o m Unit
-subscribe es = HalogenM $ liftF $ Subscribe es unit
+subscribe
+  :: forall s f g p o m r
+   . ES.EventSource f m
+  -> HalogenM ( state :: s
+              , query :: QueryRow f
+              , childQuery :: QueryRow g
+              , childSlot :: p
+              , output :: o
+              , effect :: EffectRow m|r) Unit
+subscribe es = from $ liftF $ Subscribe es unit
 
 -- | Raises an output message for the component.
-raise :: forall s f g p o m. o -> HalogenM s f g p o m Unit
-raise o = HalogenM $ liftF $ Raise o unit
+raise
+  :: forall s f g p o m r
+   . o
+  -> HalogenM ( state :: s
+              , query :: QueryRow f
+              , childQuery :: QueryRow g
+              , childSlot :: p
+              , output :: o
+              , effect :: EffectRow m |r) Unit
+raise o = from $ liftF $ Raise o unit
 
 hoist
-  :: forall s f g p o m m'
+  :: forall s f g p o m m' r
    . Functor m'
   => (m ~> m')
-  -> HalogenM s f g p o m
-  ~> HalogenM s f g p o m'
-hoist nat (HalogenM fa) = HalogenM (hoistFree go fa)
+  -> HalogenM ( state :: s
+              , query :: QueryRow f
+              , childQuery :: QueryRow g
+              , childSlot :: p
+              , output :: o
+              , effect :: EffectRow m|r)
+  ~> HalogenM ( state :: s
+              , query :: QueryRow f
+              , childQuery :: QueryRow g
+              , childSlot :: p
+              , output :: o
+              , effect :: EffectRow m'|r)
+hoist nat hal = from $ hoistFree go $ to hal
   where
-  go :: HalogenF s f g p o m ~> HalogenF s f g p o m'
+  go ∷ HalogenF s f g p o m r ~> HalogenF s f g p o m' r
   go = case _ of
     GetState k -> GetState k
     ModifyState f -> ModifyState f
     Subscribe es next -> Subscribe (ES.hoist nat es) next
     Lift q -> Lift (nat q)
-    Halt msg -> Halt msg
     GetSlots k -> GetSlots k
     CheckSlot p k -> CheckSlot p k
     ChildQuery p cq -> ChildQuery p cq
     Raise o a -> Raise o a
-    Par p -> Par (over HalogenAp (hoistFreeAp (hoist nat)) p)
-    Fork f -> Fork (FF.hoistFork (hoist nat) f)
+    Par p -> Par (over HalogenAp (hoistFreeAp (hoistFree go)) p)
+    Fork f -> Fork (FF.hoistFork (hoistFree go) f)
     GetRef p k -> GetRef p k
+    Halt msg -> Halt msg

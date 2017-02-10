@@ -7,8 +7,8 @@ module Halogen.Query
   , request
   , query
   , query'
-  , queryAll
-  , queryAll'
+--  , queryAll
+--  , queryAll'
   , getHTMLElementRef
   , module Exports
   , module Halogen.Query.EventSource
@@ -31,7 +31,7 @@ import DOM.HTML.Types (HTMLElement, readHTMLElement)
 
 import Halogen.Component.ChildPath (ChildPath, injSlot, prjSlot, injQuery, cpI)
 import Halogen.Query.EventSource (EventSource, SubscribeStatus(..), eventSource, eventSource_)
-import Halogen.Query.HalogenM (HalogenM(..), HalogenF(..), getRef, getSlots, checkSlot, mkQuery)
+import Halogen.Query.HalogenM (HalogenM, HalogenF(..), getRef, getSlots, checkSlot, mkQuery, QueryRow, EffectRow, class RowEquals, toR, fromR)
 
 import Control.Parallel (parTraverse)
 import Control.Monad.Aff.Class (liftAff) as Exports
@@ -40,6 +40,8 @@ import Control.Monad.State.Class (get, gets, modify, put) as Exports
 import Control.Monad.Trans.Class (lift) as Exports
 import Halogen.Query.InputF (RefLabel(..))
 import Halogen.Query.HalogenM (subscribe, raise) as Exports
+
+import Unsafe.Coerce (unsafeCoerce)
 
 -- | Type synonym for an "action" - An action only causes effects and has no
 -- | result value.
@@ -98,40 +100,58 @@ request req = req id
 
 -- | Sends a query to a child of a component at the specified slot.
 query
-  :: forall s f g p o m a
+  :: forall s f g p o m a r
    . Eq p
   => p
   -> g a
-  -> HalogenM s f g p o m (Maybe a)
+  -> HalogenM ( state :: s
+              , query :: QueryRow f
+              , childQuery :: QueryRow g
+              , childSlot :: p
+              , output :: o
+              , effect :: EffectRow m
+              | r) (Maybe a)
 query p q = checkSlot p >>= if _ then Just <$> mkQuery p q else pure Nothing
 
 -- | Sends a query to a child of a component at the specified slot, using a
 -- | `ChildPath` to discriminate the type of child component to query.
 query'
-  :: forall s f g g' m p p' o a
+  :: forall s f g g' m p p' o a r
    . Eq p'
   => ChildPath g g' p p'
   -> p
   -> g a
-  -> HalogenM s f g' p' o m (Maybe a)
+  -> HalogenM ( state :: s
+              , query :: QueryRow f
+              , childQuery :: QueryRow g'
+              , childSlot :: p'
+              , output :: o
+              , effect :: EffectRow m
+              | r) (Maybe a)
 query' path p q = query (injSlot path p) (injQuery path q)
 
 -- | Sends a query to all children of a component.
 queryAll
-  :: forall s f g p o m a
+  :: forall s f g p o m a r
    . Ord p
   => g a
-  -> HalogenM s f g p o m (M.Map p a)
-queryAll = queryAll' cpI
+  -> HalogenM ( state :: s
+              , query :: QueryRow f
+              , childQuery :: QueryRow g
+              , childSlot :: p
+              , output :: o
+              , effect :: EffectRow m
+              | r) (M.Map p a)
+queryAll = queryAll' cpI -- WTF?
 
 -- | Sends a query to all children of a specific type within a component, using
 -- | a `ChildPath` to discriminate the type of child component to query.
 queryAll'
-  :: forall s f g g' p p' o m a
+  :: forall s f g g' p p' o m a r rr
    . (Ord p, Eq p')
   => ChildPath g g' p p'
   -> g a
-  -> HalogenM s f g' p' o m (M.Map p a)
+  -> HalogenM _ (M.Map p a)
 queryAll' path q = do
   slots <- L.mapMaybe (prjSlot path) <$> getSlots
   M.fromFoldable <$>
@@ -139,7 +159,16 @@ queryAll' path q = do
       (\p -> map (Tuple p) (mkQuery (injSlot path p) (injQuery path q)))
       slots
 
-getHTMLElementRef :: forall s f g p o m. RefLabel -> HalogenM s f g p o m (Maybe HTMLElement)
+getHTMLElementRef
+  :: forall s f g p o m r
+   . RefLabel
+  -> HalogenM ( state :: s
+              , query :: QueryRow f
+              , childQuery :: QueryRow g
+              , childSlot :: p
+              , output :: o
+              , effect :: EffectRow m
+              | r) (Maybe HTMLElement)
 getHTMLElementRef = map (go =<< _) <<< getRef
   where
   go :: Foreign -> Maybe HTMLElement
